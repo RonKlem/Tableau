@@ -1,0 +1,18 @@
+{ 
+"CloudTokenName": "tableau_cloud_PAT", 
+"CloudTokenSecret": "insert_token_here", 
+"TokenName": "tableau_onprem_PAT", 
+"TokenSecret": "insert_token_here", 
+"http_options": "C:/path_to_pem_file.pem", 
+"CloudServerURL": "https://cloud.url.org/", 
+"OnPremServerURL": "https://tableau.onprem.url.org/", 
+"CloudSiteID": "CloudSiteID", 
+"OnPremSiteID": "OnPremSiteID", 
+"ProjectName": "Project Name", 
+"DownloadPath": "C:/path_to_where_you_want_to_download", 
+"Datasources": [
+    "Data Source 1",
+    "Data Source 2", 
+    "Data Source 3"
+  ]
+}
