@@ -10,9 +10,12 @@
 "OnPremSiteID": "OnPremSiteID", 
 "ProjectName": "Project Name", 
 "DownloadPath": "C:/path_to_where_you_want_to_download", 
-"Datasources": [
-    "Data Source 1",
-    "Data Source 2", 
-    "Data Source 3"
+  "Datasources": [
+      "Data Source 1",
+      "Data Source 2", 
+      "Data Source 3"
+    ],
+  "ProjectsToCheck": [
+    "YourProjectNameHere"
   ]
 }
