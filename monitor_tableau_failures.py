@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timedelta
 from retrying import retry
 import tableauserverclient as TSC
-from tableauserverclient import RequestOptions, Filter, PageRequest
+from tableauserverclient import RequestOptions, Filter
 
 # ─── Load Config & Logging ─────────────────────────────────────────────────────
 
@@ -75,11 +75,17 @@ def collect_project_ids(server, root_names):
     return selected_ids
 
 def get_datasources_for_projects(server, project_ids):
-    """
-    Return all DataSourceItem objects whose project_id is in project_ids.
-    """
-    all_dss, _ = server.data_sources.get()
-    return [ds for ds in all_dss if ds.project_id in project_ids]
+    opts = RequestOptions()
+    # If you only have one project_id, you can do:
+    # opts.filter.add(Filter(
+    #     field    = RequestOptions.Field.ProjectId,
+    #     operator = RequestOptions.Operator.Equals,
+    #     value    = project_id
+    # ))
+
+    # For multiple project IDs, fetch all and filter in Python:
+    all_ds, _ = server.datasources.get(req_options=opts)
+    return [ds for ds in all_ds if ds.project_id in project_ids]
 
 def get_datasources_in_projects(server, projects):
     """
@@ -110,10 +116,8 @@ def get_prep_flows_in_projects(server, projects):
     return prep_flows
 
 def get_flows_for_projects(server, project_ids):
-    """
-    Return all PrepFlowItem objects whose project_id is in project_ids.
-    """
-    all_flows, _ = server.prep_conductors.get_flows()
+    opts = RequestOptions()
+    all_flows, _ = server.flows.get(req_options=opts)
     return [flow for flow in all_flows if flow.project_id in project_ids]
 
 # ─── Job-Failure Retrieval ─────────────────────────────────────────────────────
