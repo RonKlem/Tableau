@@ -403,8 +403,7 @@ def check_prep_flows(server: TSC.Server) -> List[Dict[str, Any]]:
         except Exception as e:
             logging.error(f'Error checking prep flows: {e}')
         return failed
-    # ...existing code...
-# Entry point for the script
+
 def main():
     """
     Main function to check Tableau datasources and prep flows for failures.
@@ -434,9 +433,6 @@ def main():
 
     except Exception as e:
         logging.error(f"Failed to complete Tableau check: {e}")
-
-if __name__ == "__main__":
-    main()
 
 # Entry point for the script
 if __name__ == "__main__":
