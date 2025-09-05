@@ -81,12 +81,16 @@ def get_projects_by_name(server, project_names):
     projects = []
     try:
         all_projects = server.projects.get()
-        logging.info(f"Retrieved {len(all_projects)} projects from the server.")
-        for project in all_projects:
-            if isinstance(project, TSC.ProjectItem) and project.name in project_names:
+        # Filter only ProjectItem objects
+        filtered_projects = [p for p in all_projects if isinstance(p, TSC.ProjectItem)]
+        logging.info(f"Retrieved {len(filtered_projects)} projects from the server.")
+        for project in filtered_projects:
+            if project.name in project_names:
                 projects.append(project)
-            else:
-                logging.warning(f"Unexpected project type or name: {project}")
+        # Log any unexpected types
+        unexpected = [p for p in all_projects if not isinstance(p, TSC.ProjectItem)]
+        for item in unexpected:
+            logging.warning(f"Unexpected project type: {type(item).__name__} - {item}")
     except Exception as e:
         logging.error(f"Error retrieving projects: {e}")
     return projects
