@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timedelta
 from retrying import retry
 import tableauserverclient as TSC
+from tableauserverclient import RequestOptions, Filter, PageRequest
 
 # ─── Load Config & Logging ─────────────────────────────────────────────────────
 
@@ -80,6 +81,34 @@ def get_datasources_for_projects(server, project_ids):
     all_dss, _ = server.data_sources.get()
     return [ds for ds in all_dss if ds.project_id in project_ids]
 
+def get_datasources_in_projects(server, projects):
+    """
+    Return all DataSourceItem objects whose project_id is in `projects`.
+    """
+    data_sources = []
+    try:
+        all_ds, _ = server.datasources.get()                  
+        for ds in all_ds:
+            if ds.project_id in {p.id for p in projects}:
+                data_sources.append(ds)
+    except Exception as e:
+        logging.error(f"Error retrieving data sources: {e}")
+    return data_sources
+    
+def get_prep_flows_in_projects(server, projects):
+    """
+    Return all Prep Flow (FlowItem) objects in each project in `projects`.
+    """
+    prep_flows = []
+    try:
+        all_flows, _ = server.flows.get()                     
+        for flow in all_flows:
+            if flow.project_id in {p.id for p in projects}:
+                prep_flows.append(flow)
+    except Exception as e:
+        logging.error(f"Error retrieving prep flows: {e}")
+    return prep_flows
+
 def get_flows_for_projects(server, project_ids):
     """
     Return all PrepFlowItem objects whose project_id is in project_ids.
@@ -141,6 +170,53 @@ def get_failed_jobs_for_resource(server, job_type, resource_item):
 
     return failures
 
+def get_failed_data_source_refreshes(server, data_sources):
+    """
+    For each DataSourceItem, pull its refresh history via the Datasources endpoint,
+    then record the most recent FAILED run.
+    """
+    failed_refreshes = []
+    try:
+        for ds in data_sources:
+            history, _ = server.datasources.get_refresh_history(ds.id)  
+            for entry in history:
+                if entry.status == entry.RefreshStatus.FAILED:
+                    failed_refreshes.append({
+                        'name':      ds.name,
+                        'project':   ds.project_name,
+                        'timestamp': entry.end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'error':     entry.error_message,
+                        'link':      f"{server.server_info.content_url}/#/site/"
+                                     f"{server.auth.site_id}/views/datasources/{ds.id}"
+                    })
+                    break  # most recent failure only
+    except Exception as e:
+        logging.error(f"Error retrieving failed data source refreshes: {e}")
+    return failed_refreshes
+
+def get_failed_prep_flow_runs(server, prep_flows):
+    """
+    For each FlowItem, pull its run history via the FlowRuns endpoint,
+    then record the most recent FAILED run.
+    """
+    failed_runs = []
+    try:
+        for flow in prep_flows:
+            runs, _ = server.flow_runs.get(flow.id)             
+            for run in runs:
+                if run.status == run.RunStatus.FAILED:
+                    failed_runs.append({
+                        'name':      flow.name,
+                        'project':   flow.project_name,
+                        'timestamp': run.end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'error':     run.error_message,
+                        'link':      f"{server.server_info.content_url}/#/site/"
+                                     f"{server.auth.site_id}/flows/{flow.id}/run/{run.id}"
+                    })
+                    break
+    except Exception as e:
+        logging.error(f"Error retrieving failed prep flow runs: {e}")
+    return failed_runs
 
 def send_teams_notification(failures, env_label):
     """
@@ -200,46 +276,39 @@ def send_teams_notification(failures, env_label):
 # ─── Main Environment Check ────────────────────────────────────────────────────
 
 def check_environment(is_cloud=False):
-    """
-    Signs in, finds all datasources & flows under ProjectsToCheck (and subprojects),
-    collects failures, sends Teams alerts, and signs out.
-    """
-    prefix   = 'Cloud' if is_cloud else 'OnPrem'
-    server_url = cf[f"{prefix}ServerURL"]
-    token_name = cf[f"{prefix}TokenName"]
-    token_sec  = cf[f"{prefix}TokenSecret"]
-    site_id    = cf.get(f"{prefix}SiteID", "")
-    env_label  = "Tableau Cloud" if is_cloud else "Tableau On-Prem"
-    server     = None
+    prefix = 'Cloud' if is_cloud else 'OnPrem'
+    server = None
 
     try:
-        server = sign_in(server_url, token_name, token_sec, site_id)
-        logging.info(f"Connected to {env_label}")
+        server = sign_in(
+            cf[f"{prefix}ServerURL"],
+            cf[f"{prefix}TokenName"],
+            cf[f"{prefix}TokenSecret"],
+            cf.get(f"{prefix}SiteID", "")
+        )
 
-        # 1. Collect project IDs (roots + subprojects)
+        # 1. Scope to ProjectsToCheck (and subprojects)
         project_ids = collect_project_ids(server, cf['ProjectsToCheck'])
+        projects    = [p for p in server.projects.get()[0] if p.id in project_ids]
 
-        # 2. Fetch resources in those projects
-        datasources = get_datasources_for_projects(server, project_ids)
-        flows       = get_flows_for_projects(server, project_ids)
+        # 2. Grab datasources and flows
+        datasources = get_datasources_in_projects(server, projects)
+        prep_flows   = get_prep_flows_in_projects(server, projects)
 
-        # 3. Gather failures per resource
+        # 3. Check each for failures
         failures = []
-        for ds in datasources:
-            failures += get_failed_jobs_for_resource(server, JOB_TYPE_EXTRACT, ds)
-        for flow in flows:
-            failures += get_failed_jobs_for_resource(server, JOB_TYPE_FLOW, flow)
+        failures += get_failed_data_source_refreshes(server, datasources)
+        failures += get_failed_prep_flow_runs  (server, prep_flows)
 
-        # 4. Send Teams notifications
-        send_teams_notification(failures, env_label)
+        # 4. Alert
+        send_teams_notification(failures, 'Tableau Cloud' if is_cloud else 'Tableau On-Prem')
 
     except Exception as e:
-        logging.error(f"Issue in {env_label}: {e}")
+        logging.error(f"Issue in {prefix}: {e}")
 
     finally:
         if server:
             sign_out(server)
-
 
 # ─── Entry Point ───────────────────────────────────────────────────────────────
 
