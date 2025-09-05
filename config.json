@@ -10,6 +10,7 @@
 "OnPremSiteID": "OnPremSiteID", 
 "ProjectName": "Project Name", 
 "DownloadPath": "C:/path_to_where_you_want_to_download", 
+"TeamsWebhookURL": "https://webhookurl.com",
   "Datasources": [
       "Data Source 1",
       "Data Source 2", 
