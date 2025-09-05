@@ -1,27 +1,79 @@
+# Helper: Get project ID to name mapping
+def get_project_id_to_name(server: TSC.Server) -> Dict[str, str]:
+    all_projects = server.projects.get()
+    if isinstance(all_projects, tuple):
+        all_projects = all_projects[0]
+    return {p.id: p.name for p in all_projects}
+
+# Helper: Get latest run from a list of runs
+def get_latest_run(runs: List[Any]) -> Optional[Any]:
+    if not runs:
+        return None
+    return max(
+        runs,
+        key=lambda r: getattr(r, '_completed_at', None) or getattr(r, '_created_at', None) or ''
+    )
+
+# Helper: Get all project IDs to check, including sub-projects
+def get_project_ids_to_check(server: TSC.Server, projects_to_check: Optional[List[str]]) -> Optional[set]:
+    try:
+        all_projects = server.projects.get()
+        if isinstance(all_projects, tuple):
+            all_projects = all_projects[0]
+        name_to_project = {p.name: p for p in all_projects}
+        parent_to_children = {}
+        for p in all_projects:
+            parent_to_children.setdefault(p.parent_id, []).append(p)
+        ids_to_check = set()
+        def add_with_children(project):
+            ids_to_check.add(project.id)
+            for child in parent_to_children.get(project.id, []):
+                add_with_children(child)
+        if not projects_to_check:
+            return None
+        for name in projects_to_check:
+            project = name_to_project.get(name)
+            if project:
+                add_with_children(project)
+        return ids_to_check
+    except Exception as e:
+        logging.error(f"Error in get_project_ids_to_check: {e}")
+        return None
+
 
 import tableauserverclient as TSC
 import json
 import requests
 import logging
 from retrying import retry
+from typing import List, Dict, Any, Optional
+# Helper: Get project ID to name mapping
+def get_project_id_to_name(server: TSC.Server) -> Dict[str, str]:
+    all_projects = server.projects.get()
+    if isinstance(all_projects, tuple):
+        all_projects = all_projects[0]
+    return {p.id: p.name for p in all_projects}
 
-# Configure logging to record script activity and errors
-logging.basicConfig(
-    filename='tableau_status_check.log',  # Log file name
-    filemode='a',                        # Append to log file
-    level=logging.INFO,                  # Log info and above
-    format='%(asctime)s - %(levelname)s - %(message)s'  # Log format
-)
+# Helper: Get latest run from a list of runs
+def get_latest_run(runs: List[Any]) -> Optional[Any]:
+    if not runs:
+        return None
+    return max(
+        runs,
+        key=lambda r: getattr(r, '_completed_at', None) or getattr(r, '_created_at', None) or ''
+    )
 
 # Load configuration settings from config.json
 # This file contains Tableau login info and other settings
+
 with open('config.json') as config_file:
     cf = json.load(config_file)
+
+
 
 # Support for single or multiple projects, including sub-projects
 projects_to_check = cf.get('ProjectsToCheck')
 if not projects_to_check:
-    
     projects_to_check = None  # None means check all
 
 
@@ -240,7 +292,7 @@ def send_teams_notification(failed_datasources, failed_flows):
 
             logging.error(f'Exception sending Teams details notification: {e}')
 
-def check_datasource_refreshes(server):
+def check_datasource_refreshes(server: TSC.Server) -> List[Dict[str, Any]]:
     """
     Checks the refresh status of all Tableau datasources accessible via the provided server object.
     This function retrieves all datasources and their associated refresh tasks, then identifies those
@@ -267,76 +319,35 @@ def check_datasource_refreshes(server):
     """
 
     # Initialize a list to collect failed datasources
-    failed = []
-
+    failed: List[Dict[str, Any]] = []
     try:
-
-        # Get all datasources
         req_options = TSC.RequestOptions()
         all_datasources = server.datasources.get(req_options)
-
-        # Check if the response is a tuple
         if isinstance(all_datasources, tuple):
-
-            # Unpack the tuple
             all_datasources = all_datasources[0]
-
-        # Get all project IDs to check (including sub-projects)
-        project_ids_to_check = get_all_project_ids_to_check(server, projects_to_check)
-
-        # Get all projects
-        all_projects = server.projects.get()
-
-        # Check if the response is a tuple
-        if isinstance(all_projects, tuple):
-
-            # Unpack the tuple
-            all_projects = all_projects[0]
-
-        # Map project IDs to their names
-        id_to_project = {p.id: p.name for p in all_projects}
-
-        # Check each datasource
+        project_ids_to_check = get_project_ids_to_check(server, projects_to_check)
+        id_to_project = get_project_id_to_name(server)
         for ds in all_datasources:
-
-            # If project_ids_to_check is None, check all datasources
             if (project_ids_to_check is None) or (hasattr(ds, 'project_id') and ds.project_id in project_ids_to_check):
-                
-                # Get the latest refresh task for this datasource
                 tasks = server.tasks.get()
                 if isinstance(tasks, tuple):
                     tasks = tasks[0]
-
-                # Filter tasks for the current datasource
                 ds_tasks = [task for task in tasks if hasattr(task, 'datasource_id') and task.datasource_id == ds.id]
-                
-                # Check if there are any tasks for this datasource
-                if ds_tasks:
-
-                    # Get the latest task
-                    latest_task = max(ds_tasks, key=lambda t: getattr(t, 'updated_at', None) or getattr(t, 'created_at', None) or '')
-
-                    # Check if the latest task has failed
-                    if hasattr(latest_task, 'status') and latest_task.status == 'Failed':
-
-                        # Use Tableau's built-in webpage URL if available
-                        ds_link = getattr(ds, '_webpage_url', None)
-
-                        # Append failed datasource information
-                        failed.append({
-                            'name': ds.name,
-                            'project': id_to_project.get(ds.project_id, 'Unknown'),
-                            'timestamp': getattr(latest_task, 'updated_at', None) or getattr(latest_task, 'created_at', None) or 'Unknown',
-                            'error': getattr(latest_task, 'error_message', None) or getattr(latest_task, 'status', 'Unknown'),
-                            'link': ds_link
-                        })
-
+                latest_task = get_latest_run(ds_tasks)
+                if latest_task and hasattr(latest_task, 'status') and latest_task.status == 'Failed':
+                    ds_link = getattr(ds, '_webpage_url', None)
+                    failed.append({
+                        'name': ds.name,
+                        'project': id_to_project.get(ds.project_id, 'Unknown'),
+                        'timestamp': getattr(latest_task, 'updated_at', None) or getattr(latest_task, 'created_at', None) or 'Unknown',
+                        'error': getattr(latest_task, 'error_message', None) or getattr(latest_task, 'status', 'Unknown'),
+                        'link': ds_link
+                    })
     except Exception as e:
         logging.error(f'Error checking datasource refreshes: {e}')
-
     return failed
 
-def check_prep_flows(server):
+def check_prep_flows(server: TSC.Server) -> List[Dict[str, Any]]:
     """
     Checks the status of Tableau Prep flows on the specified Tableau server and returns a list of failed flows with details.
     This function queries all flows available on the Tableau server, filters them based on specified project IDs (including sub-projects),
@@ -361,65 +372,39 @@ def check_prep_flows(server):
     failed = []
     try:
         logging.info('Querying all flows on site')
-        flows = server.flows.get()
-        if isinstance(flows, tuple):
-            flows = flows[0]
-
-        # Get all project IDs to check (including sub-projects)
-        project_ids_to_check = get_all_project_ids_to_check(server, projects_to_check)
-
-        # Get all projects and map project IDs to names
-        all_projects = server.projects.get()
-        if isinstance(all_projects, tuple):
-            all_projects = all_projects[0]
-        id_to_project = {p.id: p.name for p in all_projects}
-
-        for flow in flows:
-
-            # If project_ids_to_check is None, check all flows
-            if (project_ids_to_check is None) or (hasattr(flow, 'project_id') and flow.project_id in project_ids_to_check):
-                logging.info('Querying all flow runs on site')
-
-                # DEBUG: Log all attributes of the flow object for troubleshooting
-                logging.info(f"Flow attributes: {vars(flow)}")
-                logging.info(f"Using flow.name: {getattr(flow, 'name', None)}, flow.id: {getattr(flow, 'id', None)}")
-
-                # Get all flow runs for the current flow
-                runs = server.flow_runs.get()
-                # Check if runs is a tuple (for compatibility)
-                if isinstance(runs, tuple):
-                    # Unpack the tuple
-                    runs = runs[0]
-
-                # Get all flow runs for the current flow
-                flow_runs = [run for run in runs if run.flow_id == flow.id]
-
-                # Check if there are any flow runs for the current flow
-                if flow_runs:
-
-                        # Sort flow runs by _completed_at, falling back to _created_at
-                        def run_sort_key(r):
-                            return getattr(r, '_completed_at', None) or getattr(r, '_created_at', None) or ''
-
-                        latest_run = max(flow_runs, key=run_sort_key)
-
-                        # Only flag as failed if the most recent run's status is "Failed"
-                        if getattr(latest_run, 'status', None) == 'Failed':
-                            logging.info(f"Latest run attributes: {vars(latest_run)}")
-                            flow_link = getattr(flow, '_webpage_url', None)
-                            failed.append({
-                                'name': getattr(flow, 'name', None),
-                                'project': id_to_project.get(flow.project_id, 'Unknown'),
-                                'timestamp': getattr(latest_run, '_completed_at', None) or getattr(latest_run, '_created_at', None) or 'Unknown',
-                                'error': getattr(latest_run, 'error_message', None) or getattr(latest_run, 'status', 'Unknown'),
-                                'link': flow_link
-                            })
-
-    except Exception as e:
-        logging.error(f'Error checking prep flows: {e}')
-
-    return failed
-
+        failed: List[Dict[str, Any]] = []
+        try:
+            logging.info('Querying all flows on site')
+            flows = server.flows.get()
+            if isinstance(flows, tuple):
+                flows = flows[0]
+            project_ids_to_check = get_project_ids_to_check(server, projects_to_check)
+            id_to_project = get_project_id_to_name(server)
+            for flow in flows:
+                if (project_ids_to_check is None) or (hasattr(flow, 'project_id') and flow.project_id in project_ids_to_check):
+                    logging.info('Querying all flow runs on site')
+                    logging.info(f"Flow attributes: {vars(flow)}")
+                    logging.info(f"Using flow.name: {getattr(flow, 'name', None)}, flow.id: {getattr(flow, 'id', None)}")
+                    runs = server.flow_runs.get()
+                    if isinstance(runs, tuple):
+                        runs = runs[0]
+                    flow_runs = [run for run in runs if run.flow_id == flow.id]
+                    latest_run = get_latest_run(flow_runs)
+                    if latest_run and latest_run.status == 'Failed':
+                        logging.info(f"Latest run attributes: {vars(latest_run)}")
+                        flow_link = getattr(flow, '_webpage_url', None)
+                        failed.append({
+                            'name': getattr(flow, 'name', None),
+                            'project': id_to_project.get(flow.project_id, 'Unknown'),
+                            'timestamp': getattr(latest_run, '_completed_at', None) or getattr(latest_run, '_created_at', None) or 'Unknown',
+                            'error': getattr(latest_run, 'error_message', None) or getattr(latest_run, 'status', 'Unknown'),
+                            'link': flow_link
+                        })
+        except Exception as e:
+            logging.error(f'Error checking prep flows: {e}')
+        return failed
+    # ...existing code...
+# Entry point for the script
 def main():
     """
     Main function to check Tableau datasources and prep flows for failures.
@@ -449,6 +434,9 @@ def main():
 
     except Exception as e:
         logging.error(f"Failed to complete Tableau check: {e}")
+
+if __name__ == "__main__":
+    main()
 
 # Entry point for the script
 if __name__ == "__main__":
