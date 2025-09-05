@@ -10,7 +10,7 @@ def load_config(config_path):
     with open(config_path) as config_file:
         return json.load(config_file)
 
-cf = load_config('C:/Repos/FRFS_Marketing_Data/python/tableau_cloud_to_onprem/config.json')
+cf = load_config('config.json')
 
 def setup_logging(log_file='tableau_status_check.log'):
     logging.basicConfig(
