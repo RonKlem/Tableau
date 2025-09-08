@@ -174,29 +174,50 @@ def get_failed_jobs_for_resource(server, job_type, resource_item):
 
     return failures
 
-def get_failed_data_source_refreshes(server, data_sources):
+def get_failed_data_source_refreshes(server, data_sources, lookback_hours=4):
     """
-    For each DataSourceItem, pull its refresh history via the Datasources endpoint,
-    then record the most recent FAILED run.
+    For each DataSourceItem in `data_sources`, use the Jobs API to fetch
+    extract-refresh jobs in the last `lookback_hours`. Return any failed job.
     """
-    failed_refreshes = []
-    try:
-        for ds in data_sources:
-            history, _ = server.datasources.get_refresh_history(ds.id)  
-            for entry in history:
-                if entry.status == entry.RefreshStatus.FAILED:
-                    failed_refreshes.append({
-                        'name':      ds.name,
-                        'project':   ds.project_name,
-                        'timestamp': entry.end_time.strftime('%Y-%m-%d %H:%M:%S'),
-                        'error':     entry.error_message,
-                        'link':      f"{server.server_info.content_url}/#/site/"
-                                     f"{server.auth.site_id}/views/datasources/{ds.id}"
-                    })
-                    break  # most recent failure only
-    except Exception as e:
-        logging.error(f"Error retrieving failed data source refreshes: {e}")
-    return failed_refreshes
+    cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+    failures = []
+
+    for ds in data_sources:
+        # Build filter: job type + this datasource
+        opts = TSC.RequestOptions()
+        opts.filter.add(TSC.Filter(
+            field    = TSC.RequestOptions.Field.Type,
+            operator = TSC.RequestOptions.Operator.Equals,
+            value    = "RefreshExtract"
+        ))
+        opts.filter.add(TSC.Filter(
+            field    = TSC.RequestOptions.Field.DatasourceId,
+            operator = TSC.RequestOptions.Operator.Equals,
+            value    = ds.id
+        ))
+        opts.sort.add(TSC.Sort(
+            field     = TSC.RequestOptions.Field.CreatedAt,
+            direction = TSC.RequestOptions.Direction.Desc
+        ))
+
+        jobs, _ = server.jobs.get(req_options=opts)
+        for job in jobs:
+            created = job.created_at.replace(tzinfo=None)
+            if job.finish_code != 0 and created >= cutoff:
+                details = server.jobs.get_job_details(job.id)
+                failures.append({
+                    'name'         : ds.name,
+                    'project'      : ds.project_name,
+                    'job_id'       : job.id,
+                    'finish_code'  : job.finish_code,
+                    'created_at'   : created.strftime('%Y-%m-%d %H:%M:%S'),
+                    'error'        : getattr(details, 'error_detail', 'Unknown error'),
+                    'link'         : f"{server.server_info.content_url}/#/site/"
+                                    f"{server.auth.site_id}/views/datasources/{ds.id}"
+                })
+                break  # stop after the most recent failure
+
+    return failures
 
 def get_failed_prep_flow_runs(server, prep_flows):
     """
