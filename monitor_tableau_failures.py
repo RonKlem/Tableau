@@ -2,11 +2,12 @@ import json
 import logging
 import requests
 import sys
+from zoneinfo import ZoneInfo
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from retrying import retry
 import tableauserverclient as TSC
-from tableauserverclient import RequestOptions, Filter
+from tableauserverclient import RequestOptions, Filter, Sort
 
 # ─── Load Config & Logging ─────────────────────────────────────────────────────
 
@@ -25,19 +26,65 @@ TIMEFRAME_HOURS    = cf.get('TimeframeHours', 4)
 JOB_TYPE_EXTRACT   = 'RefreshExtract'
 JOB_TYPE_FLOW      = 'RunFlow'
 
+def cutoff_time():
+    """
+        Calculate the cutoff time for job lookback.
+
+        Returns:
+            str: The UTC cutoff time formatted for Tableau REST API queries (YYYY-MM-DDTHH:MM:SSZ).
+    """
+    try:
+        # Get the current time in UTC
+        utc_time = datetime.now(timezone.utc)
+
+        # Use a timedelta to calculate the cutoff
+        cutoff = utc_time - timedelta(hours=TIMEFRAME_HOURS)
+        return cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    except Exception as e:
+        logging.error(f"Error calculating cutoff time: {e}")
+        raise
+
 # ─── Authentication Helpers ────────────────────────────────────────────────────
 
 @retry(stop_max_attempt_number=3, wait_fixed=2000)
 def sign_in(server_url, token_name, token_secret, site_id):
-    server = TSC.Server(server_url, use_server_version=True)
-    # Use your PEM path or boolean flag
-    server.add_http_options({'verify': cf.get('http_options', True)})
-    auth = TSC.PersonalAccessTokenAuth(token_name, token_secret, site_id)
-    server.auth.sign_in(auth)
-    logging.info(f"Signed in to {server_url} (site: '{site_id}')")
-    return server
+    """
+    Signs in to Tableau Server or Tableau Cloud using a Personal Access Token.
+
+    Args:
+        server_url (str): The Tableau server URL.
+        token_name (str): The name of the personal access token.
+        token_secret (str): The secret value of the personal access token.
+        site_id (str): The Tableau site ID (empty string for default site).
+
+    Returns:
+        TSC.Server: Authenticated Tableau server object.
+    """
+
+    try:
+        server = TSC.Server(server_url)         #, use_server_version=True)
+        # Use your PEM path or boolean flag
+        server.add_http_options({'verify': cf.get('http_options', True)})
+        server.version = '3.21'
+        auth = TSC.PersonalAccessTokenAuth(token_name, token_secret, site_id)
+        server.auth.sign_in(auth)
+        logging.info(f"Signed in to {server_url} (site: '{site_id}')")
+        logging.info(f"Server version: {server.version}")
+        return server
+    
+    except Exception as e:
+
+        logging.error(f"Sign-in issue: {e}")
+        raise
 
 def sign_out(server):
+    """
+    Signs out from the Tableau server session.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+    """
     try:
         server.auth.sign_out()
         logging.info("Signed out")
@@ -48,48 +95,54 @@ def sign_out(server):
 
 def collect_project_ids(server, root_names):
     """
-    Return a list of project IDs for every project named in root_names
-    plus all their descendant subprojects.
+    Collects all project IDs for the given root project names and their descendant subprojects.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        root_names (list): List of root project names to search for.
+
+    Returns:
+        set: Set of project IDs including all descendants.
     """
-    all_projects, _ = server.projects.get()
-    # Map parent → [child_ids]
-    children_map = {}
-    for proj in all_projects:
-        if proj.parent_id:
-            children_map.setdefault(proj.parent_id, []).append(proj.id)
+    try:
+        all_projects, _ = server.projects.get()
+        # Map parent → [child_ids]
+        children_map = {}
+        for proj in all_projects:
+            if proj.parent_id:
+                children_map.setdefault(proj.parent_id, []).append(proj.id)
 
-    selected_ids = set()
-    for root_name in root_names:
-        matches = [p for p in all_projects if p.name == root_name]
-        if not matches:
-            logging.warning(f"Project '{root_name}' not found on server")
-            continue
-        for root in matches:
-            stack = [root.id]
-            while stack:
-                pid = stack.pop()
-                if pid not in selected_ids:
-                    selected_ids.add(pid)
-                    stack.extend(children_map.get(pid, []))
+        selected_ids = set()
+        for root_name in root_names:
+            matches = [p for p in all_projects if p.name == root_name]
+            if not matches:
+                logging.warning(f"Project '{root_name}' not found on server")
+                continue
+            for root in matches:
+                stack = [root.id]
+                while stack:
+                    pid = stack.pop()
+                    if pid not in selected_ids:
+                        selected_ids.add(pid)
+                        stack.extend(children_map.get(pid, []))
 
-    return selected_ids
+        return selected_ids
+    
+    except Exception as e:
 
-def get_datasources_for_projects(server, project_ids):
-    opts = RequestOptions()
-    # If you only have one project_id, you can do:
-    # opts.filter.add(Filter(
-    #     field    = RequestOptions.Field.ProjectId,
-    #     operator = RequestOptions.Operator.Equals,
-    #     value    = project_id
-    # ))
-
-    # For multiple project IDs, fetch all and filter in Python:
-    all_ds, _ = server.datasources.get(req_options=opts)
-    return [ds for ds in all_ds if ds.project_id in project_ids]
+        logging.error(f"Error collecting project IDs: {e}")
+        raise
 
 def get_datasources_in_projects(server, projects):
     """
-    Return all DataSourceItem objects whose project_id is in `projects`.
+    Retrieves all Tableau DataSourceItem objects that belong to the specified projects.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        projects (list): List of ProjectItem objects to filter datasources by.
+
+    Returns:
+        list: List of DataSourceItem objects in the specified projects.
     """
     data_sources = []
     try:
@@ -103,7 +156,14 @@ def get_datasources_in_projects(server, projects):
     
 def get_prep_flows_in_projects(server, projects):
     """
-    Return all Prep Flow (FlowItem) objects in each project in `projects`.
+    Retrieves all Tableau Prep Flow (FlowItem) objects that belong to the specified projects.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        projects (list): List of ProjectItem objects to filter flows by.
+
+    Returns:
+        list: List of FlowItem objects in the specified projects.
     """
     prep_flows = []
     try:
@@ -111,196 +171,424 @@ def get_prep_flows_in_projects(server, projects):
         for flow in all_flows:
             if flow.project_id in {p.id for p in projects}:
                 prep_flows.append(flow)
+
     except Exception as e:
         logging.error(f"Error retrieving prep flows: {e}")
+        
     return prep_flows
 
-def get_flows_for_projects(server, project_ids):
-    opts = RequestOptions()
-    all_flows, _ = server.flows.get(req_options=opts)
-    return [flow for flow in all_flows if flow.project_id in project_ids]
 
 # ─── Job-Failure Retrieval ─────────────────────────────────────────────────────
 
 def get_failed_jobs_for_resource(server, job_type, resource_item):
     """
-    Fetches failed jobs of `job_type` for a specific resource (datasource or flow).
-    Returns jobs with nonzero finish_code created within TIMEFRAME_HOURS.
+    Fetches failed jobs of the specified type for a given Tableau resource (datasource or flow).
+    Only jobs with a nonzero finish_code and created within the lookback window are returned.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        job_type (str): Type of job to filter (e.g., 'RefreshExtract', 'RunFlow').
+        resource_item (DataSourceItem or FlowItem): The Tableau resource to check.
+
+    Returns:
+        list: List of dictionaries containing details about each failed job.
     """
-    cutoff = datetime.utcnow() - timedelta(hours=TIMEFRAME_HOURS)
 
-    # Build filters: by job type + by resource ID
-    opts = TSC.RequestOptions()
-    opts.filter.add(TSC.Filter(
-        field    = TSC.RequestOptions.Field.Type,
-        operator = TSC.RequestOptions.Operator.Equals,
-        value    = job_type
-    ))
+    try:
+        cutoff = cutoff_time()
 
-    # Choose the correct field for resource matching
-    field = (TSC.RequestOptions.Field.DatasourceId
-             if job_type == JOB_TYPE_EXTRACT
-             else TSC.RequestOptions.Field.FlowId)
-    opts.filter.add(TSC.Filter(
-        field    = field,
-        operator = TSC.RequestOptions.Operator.Equals,
-        value    = resource_item.id
-    ))
-
-    # Newest first
-    opts.sort.add(TSC.Sort(
-        field     = TSC.RequestOptions.Field.CreatedAt,
-        direction = TSC.RequestOptions.Direction.Desc
-    ))
-
-    all_jobs, _ = server.jobs.get(req_options=opts)
-    failures = []
-
-    for job in all_jobs:
-        created = job.created_at.replace(tzinfo=None)
-        if job.finish_code != 0 and created >= cutoff:
-            # Pull error detail
-            details = server.jobs.get_job_details(job.id)
-            failures.append({
-                'resource_type': 'Datasource' if job_type == JOB_TYPE_EXTRACT else 'Prep Flow',
-                'name'         : resource_item.name,
-                'project'      : getattr(resource_item, 'project_name', 'Unknown'),
-                'id'           : job.id,
-                'finish_code'  : job.finish_code,
-                'created_at'   : created.strftime('%Y-%m-%d %H:%M:%S'),
-                'error'        : getattr(details, 'error_detail', 'No error message')
-            })
-            break  # only the most recent failure per resource
-
-    return failures
-
-def get_failed_data_source_refreshes(server, data_sources, lookback_hours=4):
-    """
-    For each DataSourceItem in `data_sources`, use the Jobs API to fetch
-    extract-refresh jobs in the last `lookback_hours`. Return any failed job.
-    """
-    cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
-    failures = []
-
-    for ds in data_sources:
-        # Build filter: job type + this datasource
+        # Build filters: by job type + by resource ID
         opts = TSC.RequestOptions()
         opts.filter.add(TSC.Filter(
             field    = TSC.RequestOptions.Field.Type,
             operator = TSC.RequestOptions.Operator.Equals,
-            value    = "RefreshExtract"
+            value    = job_type
         ))
+
+        # Choose the correct field for resource matching
+        field = (TSC.RequestOptions.Field.DatasourceId
+                if job_type == JOB_TYPE_EXTRACT
+                else TSC.RequestOptions.Field.FlowId)
         opts.filter.add(TSC.Filter(
-            field    = TSC.RequestOptions.Field.DatasourceId,
+            field    = field,
             operator = TSC.RequestOptions.Operator.Equals,
-            value    = ds.id
+            value    = resource_item.id
         ))
+
+        # Newest first
         opts.sort.add(TSC.Sort(
             field     = TSC.RequestOptions.Field.CreatedAt,
             direction = TSC.RequestOptions.Direction.Desc
         ))
 
-        jobs, _ = server.jobs.get(req_options=opts)
-        for job in jobs:
+        all_jobs, _ = server.jobs.get(req_options=opts)
+        failures = []
+
+        for job in all_jobs:
             created = job.created_at.replace(tzinfo=None)
             if job.finish_code != 0 and created >= cutoff:
+                # Pull error detail
                 details = server.jobs.get_job_details(job.id)
                 failures.append({
-                    'name'         : ds.name,
-                    'project'      : ds.project_name,
-                    'job_id'       : job.id,
+                    'resource_type': 'Datasource' if job_type == JOB_TYPE_EXTRACT else 'Prep Flow',
+                    'name'         : resource_item.name,
+                    'project'      : getattr(resource_item, 'project_name', 'Unknown'),
+                    'id'           : job.id,
                     'finish_code'  : job.finish_code,
                     'created_at'   : created.strftime('%Y-%m-%d %H:%M:%S'),
-                    'error'        : getattr(details, 'error_detail', 'Unknown error'),
-                    'link'         : f"{server.server_info.content_url}/#/site/"
-                                    f"{server.auth.site_id}/views/datasources/{ds.id}"
+                    'error'        : getattr(details, 'error_detail', 'No error message')
                 })
-                break  # stop after the most recent failure
+                break  # only the most recent failure per resource
+
+        return failures
+    
+    except Exception as e:
+
+        logging.error(f"Error retrieving failed jobs for {resource_item.name}: {e}")
+        raise
+
+def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
+    """
+    Retrieve failed ExtractRefresh tasks for datasources belonging to specified Tableau project IDs.
+    
+    This function:
+    - Fetches all datasources and builds a lookup by datasource ID.
+    - Retrieves all tasks from Tableau Server.
+    - Filters for ExtractRefresh tasks with consecutive failures (consecutive_failed_count > 0).
+    - Checks if the associated datasource belongs to one of the provided project_ids.
+    - Returns a list of dictionaries, each containing metadata for a failed datasource refresh task.
+    
+    Args:
+        server (TSC.Server): Authenticated Tableau Server client instance.
+        project_ids (list[str]): List of Tableau project IDs to filter datasource tasks.
+    
+    Returns:
+        list[dict]: List of records for failed ExtractRefresh datasource tasks.
+    
+    Raises:
+        RuntimeError: If fetching datasources or tasks fails.
+    """
+    failures = []
+    try:
+        # Get all datasources in a simpler way
+        all_ds, _ = server.datasources.get()
+        ds_map = {ds.id: ds for ds in all_ds}
+    except Exception as e:
+        logging.error(f"Failed to fetch datasources: {e}")
+        raise RuntimeError(f"Failed to fetch datasources: {e}")
+
+    try:
+        # Get all tasks in a simpler way
+        all_tasks, _ = server.tasks.get()
+    except Exception as e:
+        logging.error(f"Failed to fetch tasks: {e}")
+        raise RuntimeError(f"Failed to fetch tasks: {e}")
+
+    for task in all_tasks:
+        try:
+            # Only consider extract refresh tasks
+            if task.task_type != 'RefreshExtract':  # Using the string value
+                continue
+            # Skip tasks with zero failures
+            if not hasattr(task, 'consecutive_failed_count') or task.consecutive_failed_count == 0:
+                continue
+
+            # Check if this is a datasource task
+            if not hasattr(task, 'data_source_id') or not task.data_source_id:
+                continue
+                
+            ds = ds_map.get(task.data_source_id)
+            if not ds or ds.project_id not in project_ids:
+                continue
+
+            # Build the URL properly
+            site_path = server.site_id if server.site_id else ""
+            base_url = server.server_address
+
+            record = {
+                'task_id':        task.id,
+                'task_type':      task.task_type,
+                'fails_in_a_row': task.consecutive_failed_count,
+                'last_run_at':    getattr(task, 'last_run_at', None),
+                'resource_type':  'Datasource',
+                'name':           ds.name,
+                'project_name':   ds.project_name,
+                'resource_id':    ds.id,
+                'url':            f"{base_url}/#/site/{site_path}/datasources/{ds.id}"
+            }
+            failures.append(record)
+        except Exception as e:
+            logging.warning(f"Failed to process task {getattr(task, 'id', 'UNKNOWN')}: {e}")
+            continue
 
     return failures
 
+def get_failed_data_source_refreshes(server, data_sources):
+    """
+    Retrieves all failed 'RefreshExtract' jobs for the given datasources within the lookback window.
+    This function fetches all jobs from Tableau, filters for failed extract refreshes, and returns details.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        data_sources (list): List of DataSourceItem objects to check for failures.
+
+    Returns:
+        list: List of dictionaries containing details about each failed datasource refresh.
+    """
+    try:
+        # Get the UTC-based cutoff time string
+        cutoff_str = cutoff_time()
+        
+        # Create a mapping of datasource IDs to their details for easy lookup
+        ds_map = {ds.id: ds for ds in data_sources}
+        failures = []
+
+        # Step 1: Get ALL jobs from the server within the lookback window
+        # Filtering by 'type' is not supported, so only filter by 'createdAt'.
+        opts = TSC.RequestOptions()
+        opts.filter.add(TSC.Filter(
+            field=TSC.RequestOptions.Field.CreatedAt,
+            operator=TSC.RequestOptions.Operator.GreaterThanOrEqual,
+            value=cutoff_str
+        ))
+        
+        logging.info("about to run server.jobs.get()")
+        all_jobs, _ = server.jobs.get(req_options=opts)
+
+        # Step 2: Iterate through all retrieved jobs to find failed RefreshExtract jobs
+        for job in all_jobs:
+            if job.type == "RefreshExtract" and job.finish_code != 0:
+                # Get the detailed job information to extract the datasource ID
+                try:
+                    details = server.jobs.get_job_details(job.id)
+                except Exception as e:
+                    logging.warning(f"Could not get details for job {job.id}: {e}")
+                    continue
+
+                # Use a `getattr` to safely check for the datasource ID attribute.
+                job_ds_id = getattr(details, 'data_source_id', None)
+
+                if job_ds_id in ds_map:
+                    ds = ds_map[job_ds_id]
+                    created = job.created_at.replace(tzinfo=None) if job.created_at else None
+                    
+                    failures.append({
+                        'resource_type': 'Data Source',
+                        'name': ds.name,
+                        'project': ds.project_name,
+                        'job_id': job.id,
+                        'finish_code': job.finish_code,
+                        'created_at': created.strftime('%Y-%m-%d %H:%M:%S') if created else 'Unknown',
+                        'error': getattr(details, 'error_details', 'Unknown error'),
+                        'link': f"{server.server_info.content_url}/#/site/"
+                                f"{server.auth.site_id}/datasources/{ds.id}"
+                    })
+        
+        return failures
+    
+    except Exception as e:
+        logging.error(f"Error retrieving failed data source refreshes: {e}")
+        raise
+
 def get_failed_prep_flow_runs(server, prep_flows):
     """
-    For each FlowItem, pull its run history via the FlowRuns endpoint,
-    then record the most recent FAILED run.
+    For each Tableau Prep Flow in the provided list, retrieves its run history using the FlowRuns endpoint.
+    Identifies the most recent run for each flow and, if it failed, records detailed information about the failure.
+    Includes flow name, project, run ID, finish code, timestamps, error message, Tableau link, and owner name.
+    Returns a list of dictionaries, each representing a failed flow run.
+
+    Args:
+        server (TSC.Server): Authenticated Tableau server object.
+        prep_flows (list): List of FlowItem objects to check for failures.
+
+    Returns:
+        list: List of dictionaries containing details about each failed flow run.
     """
     failed_runs = []
     try:
         for flow in prep_flows:
-            runs, _ = server.flow_runs.get(flow.id)             
-            for run in runs:
-                if run.status == run.RunStatus.FAILED:
+            # Create a RequestOptions object to filter by flow ID and sort by end time in descending order
+            # to get the most recent run first.
+            req_options = TSC.RequestOptions()
+            req_options.filter.add(
+                TSC.Filter(
+                    TSC.RequestOptions.Field.FlowId,
+                    TSC.RequestOptions.Operator.Equals,
+                    flow.id
+                )
+            )
+            # Sort by end time in descending order to get the latest run first.
+            req_options.sort.add(
+                TSC.Sort(
+                    TSC.RequestOptions.Field.CompletedAt,
+                    TSC.RequestOptions.Direction.Desc
+                )
+            )
+            # Get only the most recent run (page size of 1).
+            req_options.pagesize = 1
+
+            # The get() method returns a tuple: (list of FlowRunItems, PaginationItem).
+            result = server.flow_runs.get(req_options)
+
+            # Robustly handle tuple, list, or empty result
+            if isinstance(result, tuple):
+                runs = result[0] if len(result) > 0 else []
+            elif result is None:
+                runs = []
+            else:
+                runs = result
+
+            # The 'runs' variable is a list, so check if it is not empty.
+            if runs:
+                most_recent_run = runs[0]
+                status = getattr(most_recent_run, 'status', None)
+                failed_statuses = [getattr(most_recent_run, 'RunStatus', None), 'Failed', 'FAILURE', 'failure', 'failed']
+                if status and (status == getattr(most_recent_run, 'RunStatus', None) or str(status).lower() in [str(s).lower() for s in failed_statuses]):
+                    # Get owner name
+                    owner_name = None
+                    try:
+                        owner = server.users.get_by_id(flow.owner_id)
+                        owner_name = getattr(owner, 'name', None) or getattr(owner, 'full_name', None) or getattr(owner, 'email', None)
+                    except Exception as e:
+                        logging.warning(f"Could not get owner for flow {flow.name}: {e}")
                     failed_runs.append({
+                        'resource_type': 'Prep Flow',
                         'name':      flow.name,
+                        'id': most_recent_run.id,
+                        'finish_code': getattr(most_recent_run, 'finish_code', 'N/A'),
+                        'created_at': most_recent_run.end_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(most_recent_run, 'end_time') and most_recent_run.end_time else "N/A",
                         'project':   flow.project_name,
-                        'timestamp': run.end_time.strftime('%Y-%m-%d %H:%M:%S'),
-                        'error':     run.error_message,
-                        'link':      f"{server.server_info.content_url}/#/site/"
-                                     f"{server.auth.site_id}/flows/{flow.id}/run/{run.id}"
+                        'timestamp': most_recent_run.end_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(most_recent_run, 'end_time') and most_recent_run.end_time else "N/A",
+                        'error':     getattr(most_recent_run, 'error_message', None),
+                        'link':      getattr(flow, '_webpage_url', f"{cf.get('OnPremServerURL', server.baseurl)}#/site/{server.site_id}/flows/{flow.id}/"),
+                        'owner':     owner_name
                     })
-                    break
+            else:
+                logging.debug(f"No run history found for flow '{flow.name}' (ID: {flow.id}).")
+
     except Exception as e:
         logging.error(f"Error retrieving failed prep flow runs: {e}")
+        logging.exception("Exception occurred while processing a flow run.")
+        
     return failed_runs
 
 def send_teams_notification(failures, env_label):
     """
-    Sends a summary card and, if failures exist, a details card
-    to the Teams webhook.
+     Sends notifications to a Microsoft Teams webhook summarizing Tableau job failures.
+
+    This function sends a summary message card to the specified Teams webhook URL,
+    indicating the number and types of failures detected in Tableau jobs within a given timeframe.
+    If failures are present, it also sends a detailed message card listing each failed job
+    with relevant metadata.
+
+    Args:
+        failures (list of dict): A list of dictionaries, each representing a failed Tableau job.
+            Each dictionary should contain the following keys:
+                - 'resource_type': Type of Tableau resource (e.g., Workbook, Data Source).
+                - 'name': Name of the failed resource.
+                - 'project': Project name associated with the resource.
+                - 'owner': Owner of the resource.
+                - 'id': Job ID.
+                - 'finish_code': Finish code of the job.
+                - 'created_at': UTC timestamp of job creation.
+                - 'error': Error message or description.
+                - 'link': URL to view the resource in Tableau.
+        env_label (str): Label indicating the environment (e.g., "Production", "Staging") for context in notifications.
+
+    Raises:
+        Exception: Propagates any exception encountered during the notification process.
+
+    Side Effects:
+        - Sends HTTP POST requests to the Teams webhook URL configured in `cf['TeamsWebhookURL']`.
+        - Logs success or failure of notification delivery using the `logging` module.
+
+    Example:
+        send_teams_notification(failures, "Production")
     """
-    webhook_url = cf['TeamsWebhookURL']
-    title       = f"{env_label} – Tableau Failures"
+    try:
+        webhook_url = cf['TeamsWebhookURL']
+        title       = f"{env_label} – Tableau Failures"
 
-    # Build summary
-    if not failures:
-        summary_text = f"No failures in the last {TIMEFRAME_HOURS} hours."
-    else:
-        counts = {}
-        for f in failures:
-            counts[f['resource_type']] = counts.get(f['resource_type'], 0) + 1
-        parts = [f"{cnt} {rtype.lower()}(s) failed" for rtype, cnt in counts.items()]
-        summary_text = ' | '.join(parts)
+        # Build summary
+        if not failures:
+            summary_text = f"No failures in the last {TIMEFRAME_HOURS} hours."
+        else:
+            counts = {}
+            for f in failures:
+                counts[f['resource_type']] = counts.get(f['resource_type'], 0) + 1
+            parts = [f"{cnt} {rtype.lower()}(s) failed" for rtype, cnt in counts.items()]
+            summary_text = ' | '.join(parts)
 
-    summary_payload = {
-        "@type"     : "MessageCard",
-        "@context"  : "http://schema.org/extensions",
-        "themeColor": "0076D7",
-        "title"     : title,
-        "text"      : summary_text
-    }
-    resp = requests.post(webhook_url, json=summary_payload)
-    if resp.status_code != 200:
-        logging.error(f"{env_label} summary failed: {resp.status_code} {resp.text}")
-    else:
-        logging.info(f"{env_label} summary sent")
-
-    # If there are failures, send details
-    if failures:
-        lines = []
-        for f in failures:
-            lines.append(
-                f"• [{f['resource_type']}] **{f['name']}** (Project: {f['project']})  \n"
-                f"  Job ID: {f['id']}  |  Code {f['finish_code']}  |  "
-                f"Time: {f['created_at']} UTC  |  Error: {f['error']}"
-            )
-
-        detail_payload = {
+        summary_payload = {
             "@type"     : "MessageCard",
             "@context"  : "http://schema.org/extensions",
-            "themeColor": "D70076",
-            "title"     : title + " (Details)",
-            "text"      : "\n\n".join(lines)
+            "themeColor": "0076D7",
+            "title"     : title,
+            "text"      : summary_text
         }
-        resp = requests.post(webhook_url, json=detail_payload)
+        resp = requests.post(webhook_url, json=summary_payload)
         if resp.status_code != 200:
-            logging.error(f"{env_label} details failed: {resp.status_code} {resp.text}")
+            logging.error(f"{env_label} summary failed: {resp.status_code} {resp.text}")
         else:
-            logging.info(f"{env_label} details sent")
+            logging.info(f"{env_label} summary sent")
 
+        # If there are failures, send details
+        if failures:
+            lines = []
+            for f in failures:
+                lines.append(
+                    f"• [{f['resource_type']}] **{f['name']}** (Project: {f['project']}) | Owner: {f['owner']}  \n"
+                    f"  Job ID: {f['id']}  |  Code {f['finish_code']}  |  "
+                    f"Time: {f['created_at']} UTC  |  Error: {f['error']} \n\n"
+                    f"  [View in Tableau]({f['link']})"
+                )
+
+            detail_payload = {
+                "@type"     : "MessageCard",
+                "@context"  : "http://schema.org/extensions",
+                "themeColor": "D70076",
+                "title"     : title + " (Details)",
+                "text"      : "\n\n".join(lines)
+            }
+            resp = requests.post(webhook_url, json=detail_payload)
+            if resp.status_code != 200:
+                logging.error(f"{env_label} details failed: {resp.status_code} {resp.text}")
+            else:
+                logging.info(f"{env_label} details sent")
+
+    except Exception as e:
+
+        logging.error(f"Error sending Teams notification: {e}")
+        raise
 
 # ─── Main Environment Check ────────────────────────────────────────────────────
 
 def check_environment(is_cloud=False):
+    """
+    Checks the Tableau environment (Cloud or On-Prem) for failed prep flow runs and sends notifications.
+
+    This function performs the following steps:
+        1. Signs in to the Tableau server using credentials from the configuration.
+        2. Collects project IDs for the specified projects and their subprojects.
+        3. Retrieves datasources and prep flows within those projects.
+        4. Checks for failed prep flow runs (data source refresh failures are currently commented out).
+        5. Sends a notification with the list of failures to Microsoft Teams.
+        6. Signs out from the Tableau server.
+    
+    Args:
+        is_cloud (bool, optional): 
+            If True, checks Tableau Cloud environment; otherwise, checks Tableau On-Premises environment.
+            Defaults to False.
+
+    Raises:
+        Logs any exceptions encountered during the process.
+    
+    Side Effects:
+        - Sends notifications to Microsoft Teams.
+        - Prints the list of failures to stdout.
+        - Logs errors using the logging module.
+        - Signs in and out of Tableau server.
+    """
     prefix = 'Cloud' if is_cloud else 'OnPrem'
     server = None
 
@@ -322,11 +610,12 @@ def check_environment(is_cloud=False):
 
         # 3. Check each for failures
         failures = []
-        failures += get_failed_data_source_refreshes(server, datasources)
-        failures += get_failed_prep_flow_runs  (server, prep_flows)
+        failures += get_failed_extract_refresh_tasks_for_projects(server, project_ids)      #get_failed_data_source_refreshes(server, datasources)
+        #failures += get_failed_prep_flow_runs  (server, prep_flows)
+        print(failures)
 
         # 4. Alert
-        send_teams_notification(failures, 'Tableau Cloud' if is_cloud else 'Tableau On-Prem')
+        #send_teams_notification(failures, 'Tableau Cloud' if is_cloud else 'Tableau On-Prem')
 
     except Exception as e:
         logging.error(f"Issue in {prefix}: {e}")
