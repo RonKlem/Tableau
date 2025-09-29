@@ -22,9 +22,7 @@ logging.basicConfig(
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-TIMEFRAME_HOURS    = cf.get('TimeframeHours', 4)
-JOB_TYPE_EXTRACT   = 'RefreshExtract'
-JOB_TYPE_FLOW      = 'RunFlow'
+TIMEFRAME_HOURS = cf.get('TimeframeHours', 4)
 
 def cutoff_time():
     """
@@ -133,27 +131,7 @@ def collect_project_ids(server, root_names):
         logging.error(f"Error collecting project IDs: {e}")
         raise
 
-def get_datasources_in_projects(server, projects):
-    """
-    Retrieves all Tableau DataSourceItem objects that belong to the specified projects.
 
-    Args:
-        server (TSC.Server): Authenticated Tableau server object.
-        projects (list): List of ProjectItem objects to filter datasources by.
-
-    Returns:
-        list: List of DataSourceItem objects in the specified projects.
-    """
-    data_sources = []
-    try:
-        all_ds, _ = server.datasources.get()                  
-        for ds in all_ds:
-            if ds.project_id in {p.id for p in projects}:
-                data_sources.append(ds)
-    except Exception as e:
-        logging.error(f"Error retrieving data sources: {e}")
-    return data_sources
-    
 def get_prep_flows_in_projects(server, projects):
     """
     Retrieves all Tableau Prep Flow (FlowItem) objects that belong to the specified projects.
@@ -180,72 +158,7 @@ def get_prep_flows_in_projects(server, projects):
 
 # ─── Job-Failure Retrieval ─────────────────────────────────────────────────────
 
-def get_failed_jobs_for_resource(server, job_type, resource_item):
-    """
-    Fetches failed jobs of the specified type for a given Tableau resource (datasource or flow).
-    Only jobs with a nonzero finish_code and created within the lookback window are returned.
 
-    Args:
-        server (TSC.Server): Authenticated Tableau server object.
-        job_type (str): Type of job to filter (e.g., 'RefreshExtract', 'RunFlow').
-        resource_item (DataSourceItem or FlowItem): The Tableau resource to check.
-
-    Returns:
-        list: List of dictionaries containing details about each failed job.
-    """
-
-    try:
-        cutoff = cutoff_time()
-
-        # Build filters: by job type + by resource ID
-        opts = TSC.RequestOptions()
-        opts.filter.add(TSC.Filter(
-            field    = TSC.RequestOptions.Field.Type,
-            operator = TSC.RequestOptions.Operator.Equals,
-            value    = job_type
-        ))
-
-        # Choose the correct field for resource matching
-        field = (TSC.RequestOptions.Field.DatasourceId
-                if job_type == JOB_TYPE_EXTRACT
-                else TSC.RequestOptions.Field.FlowId)
-        opts.filter.add(TSC.Filter(
-            field    = field,
-            operator = TSC.RequestOptions.Operator.Equals,
-            value    = resource_item.id
-        ))
-
-        # Newest first
-        opts.sort.add(TSC.Sort(
-            field     = TSC.RequestOptions.Field.CreatedAt,
-            direction = TSC.RequestOptions.Direction.Desc
-        ))
-
-        all_jobs, _ = server.jobs.get(req_options=opts)
-        failures = []
-
-        for job in all_jobs:
-            created = job.created_at.replace(tzinfo=None)
-            if job.finish_code != 0 and created >= cutoff:
-                # Pull error detail
-                details = server.jobs.get_job_details(job.id)
-                failures.append({
-                    'resource_type': 'Datasource' if job_type == JOB_TYPE_EXTRACT else 'Prep Flow',
-                    'name'         : resource_item.name,
-                    'project'      : getattr(resource_item, 'project_name', 'Unknown'),
-                    'id'           : job.id,
-                    'finish_code'  : job.finish_code,
-                    'created_at'   : created.strftime('%Y-%m-%d %H:%M:%S'),
-                    'error'        : getattr(details, 'error_detail', 'No error message')
-                })
-                break  # only the most recent failure per resource
-
-        return failures
-    
-    except Exception as e:
-
-        logging.error(f"Error retrieving failed jobs for {resource_item.name}: {e}")
-        raise
 
 def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
     """
@@ -254,7 +167,7 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
     This function:
     - Fetches all datasources and builds a lookup by datasource ID.
     - Retrieves all tasks from Tableau Server.
-    - Filters for ExtractRefresh tasks with consecutive failures (consecutive_failed_count > 0).
+    - Filters for ExtractRefresh tasks with consecutive failures.
     - Checks if the associated datasource belongs to one of the provided project_ids.
     - Returns a list of dictionaries, each containing metadata for a failed datasource refresh task.
     
@@ -270,7 +183,6 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
     """
     failures = []
     try:
-        # Get all datasources in a simpler way
         all_ds, _ = server.datasources.get()
         ds_map = {ds.id: ds for ds in all_ds}
     except Exception as e:
@@ -278,7 +190,6 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
         raise RuntimeError(f"Failed to fetch datasources: {e}")
 
     try:
-        # Get all tasks in a simpler way
         all_tasks, _ = server.tasks.get()
     except Exception as e:
         logging.error(f"Failed to fetch tasks: {e}")
@@ -286,11 +197,14 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
 
     for task in all_tasks:
         try:
-            # Only consider extract refresh tasks
-            if task.task_type != 'RefreshExtract':  # Using the string value
+            # Only consider extract refresh tasks - use enum for robustness
+            if task.task_type != TSC.TaskItem.TaskType.ExtractRefresh:
                 continue
-            # Skip tasks with zero failures
-            if not hasattr(task, 'consecutive_failed_count') or task.consecutive_failed_count == 0:
+            
+            # Skip tasks with zero failures - handle both attribute name variations
+            consecutive_fails = (getattr(task, 'consecutive_failed_count', 0) or 
+                               getattr(task, 'consecutive_fails_count', 0))
+            if not consecutive_fails:
                 continue
 
             # Check if this is a datasource task
@@ -301,20 +215,24 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
             if not ds or ds.project_id not in project_ids:
                 continue
 
-            # Build the URL properly
-            site_path = server.site_id if server.site_id else ""
-            base_url = server.server_address
+            # Build the URL using more robust server attributes
+            try:
+                site_id = getattr(server, 'site_id', '') or getattr(server.auth, 'site_id', '')
+                base_url = getattr(server, 'server_address', None) or getattr(server.server_info, 'content_url', '')
+            except AttributeError:
+                site_id = ''
+                base_url = ''
 
             record = {
                 'task_id':        task.id,
                 'task_type':      task.task_type,
-                'fails_in_a_row': task.consecutive_failed_count,
+                'fails_in_a_row': consecutive_fails,
                 'last_run_at':    getattr(task, 'last_run_at', None),
                 'resource_type':  'Datasource',
                 'name':           ds.name,
                 'project_name':   ds.project_name,
                 'resource_id':    ds.id,
-                'url':            f"{base_url}/#/site/{site_path}/datasources/{ds.id}"
+                'url':            f"{base_url}/#/site/{site_id}/datasources/{ds.id}" if base_url else ''
             }
             failures.append(record)
         except Exception as e:
@@ -323,72 +241,6 @@ def get_failed_extract_refresh_tasks_for_projects(server, project_ids):
 
     return failures
 
-def get_failed_data_source_refreshes(server, data_sources):
-    """
-    Retrieves all failed 'RefreshExtract' jobs for the given datasources within the lookback window.
-    This function fetches all jobs from Tableau, filters for failed extract refreshes, and returns details.
-
-    Args:
-        server (TSC.Server): Authenticated Tableau server object.
-        data_sources (list): List of DataSourceItem objects to check for failures.
-
-    Returns:
-        list: List of dictionaries containing details about each failed datasource refresh.
-    """
-    try:
-        # Get the UTC-based cutoff time string
-        cutoff_str = cutoff_time()
-        
-        # Create a mapping of datasource IDs to their details for easy lookup
-        ds_map = {ds.id: ds for ds in data_sources}
-        failures = []
-
-        # Step 1: Get ALL jobs from the server within the lookback window
-        # Filtering by 'type' is not supported, so only filter by 'createdAt'.
-        opts = TSC.RequestOptions()
-        opts.filter.add(TSC.Filter(
-            field=TSC.RequestOptions.Field.CreatedAt,
-            operator=TSC.RequestOptions.Operator.GreaterThanOrEqual,
-            value=cutoff_str
-        ))
-        
-        logging.info("about to run server.jobs.get()")
-        all_jobs, _ = server.jobs.get(req_options=opts)
-
-        # Step 2: Iterate through all retrieved jobs to find failed RefreshExtract jobs
-        for job in all_jobs:
-            if job.type == "RefreshExtract" and job.finish_code != 0:
-                # Get the detailed job information to extract the datasource ID
-                try:
-                    details = server.jobs.get_job_details(job.id)
-                except Exception as e:
-                    logging.warning(f"Could not get details for job {job.id}: {e}")
-                    continue
-
-                # Use a `getattr` to safely check for the datasource ID attribute.
-                job_ds_id = getattr(details, 'data_source_id', None)
-
-                if job_ds_id in ds_map:
-                    ds = ds_map[job_ds_id]
-                    created = job.created_at.replace(tzinfo=None) if job.created_at else None
-                    
-                    failures.append({
-                        'resource_type': 'Data Source',
-                        'name': ds.name,
-                        'project': ds.project_name,
-                        'job_id': job.id,
-                        'finish_code': job.finish_code,
-                        'created_at': created.strftime('%Y-%m-%d %H:%M:%S') if created else 'Unknown',
-                        'error': getattr(details, 'error_details', 'Unknown error'),
-                        'link': f"{server.server_info.content_url}/#/site/"
-                                f"{server.auth.site_id}/datasources/{ds.id}"
-                    })
-        
-        return failures
-    
-    except Exception as e:
-        logging.error(f"Error retrieving failed data source refreshes: {e}")
-        raise
 
 def get_failed_prep_flow_runs(server, prep_flows):
     """
@@ -604,13 +456,12 @@ def check_environment(is_cloud=False):
         project_ids = collect_project_ids(server, cf['ProjectsToCheck'])
         projects    = [p for p in server.projects.get()[0] if p.id in project_ids]
 
-        # 2. Grab datasources and flows
-        datasources = get_datasources_in_projects(server, projects)
-        prep_flows   = get_prep_flows_in_projects(server, projects)
+        # 2. Grab flows for prep flow checking (datasources are fetched within the tasks function)
+        prep_flows = get_prep_flows_in_projects(server, projects)
 
         # 3. Check each for failures
         failures = []
-        failures += get_failed_extract_refresh_tasks_for_projects(server, project_ids)      #get_failed_data_source_refreshes(server, datasources)
+        failures += get_failed_extract_refresh_tasks_for_projects(server, project_ids)
         #failures += get_failed_prep_flow_runs  (server, prep_flows)
         print(failures)
 
